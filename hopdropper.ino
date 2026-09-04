@@ -2,6 +2,7 @@
 #include <PubSubClient.h>
 #include <ESP32Servo.h>
 #include <ArduinoJson.h>
+#include <EEPROM.h>
 
 // ========== KONFIGURATION ==========
 // WiFi
@@ -20,14 +21,18 @@ const int servo_pins[5] = {1, 2, 3, 4, 5};  // GPIO 1, 2, 3, 4, 5
 
 // Servo-Positionen (in Grad)
 const int servo_open = 90;    // Position offen (in Grad)
-// Nullpositionen pro Servo (geschlossene Position, individuell einstellbar 0-45°)
-int servo_home[5] = {0, 0, 0, 0, 0};  // Standard: alle auf 0°
 
 // Servo-Bewegungsgeschwindigkeit
 const unsigned long servo_move_time = 1000;  // 1 Sekunde für volle Bewegung
 
+// EEPROM Konfiguration
+#define EEPROM_SIZE 512
+#define EEPROM_MAGIC 0xAB        // Magic Byte zur Überprüfung
+#define EEPROM_MAGIC_ADDR 0      // Adresse für Magic Byte
+#define EEPROM_HOME_START 1       // Startadresse für Home-Positionen (5 Bytes)
+
 // ========== ENUM für Servo-Zustand ==========
-enum ServoState { CLOSED, OPEN, CLOSING, OPENING };
+enum ServoState { CLOSED, OPEN, CLOSING, OPENING, INITIALIZING };
 
 // ========== GLOBALE VARIABLEN ==========
 WiFiClient espClient;
@@ -35,9 +40,10 @@ PubSubClient client(espClient);
 Servo servos[5];
 
 // Servo-Status tracking
-ServoState servo_state[5] = {CLOSED, CLOSED, CLOSED, CLOSED, CLOSED};
+ServoState servo_state[5] = {INITIALIZING, INITIALIZING, INITIALIZING, INITIALIZING, INITIALIZING};
 int servo_current_pos[5] = {0, 0, 0, 0, 0};  // Aktuelle Position (0-90°)
 int servo_target_pos[5] = {0, 0, 0, 0, 0};   // Zielposition
+int servo_home[5] = {0, 0, 0, 0, 0};         // Nullpositionen (aus EEPROM)
 
 // Timer für automatisches Schließen
 unsigned long servo_close_time[5] = {0, 0, 0, 0, 0};
@@ -45,9 +51,62 @@ unsigned long servo_close_time[5] = {0, 0, 0, 0, 0};
 // Timer für sanfte Bewegung
 unsigned long servo_move_start[5] = {0, 0, 0, 0, 0};
 
+// Initialisierungs-Timer (1 Sekunde Abstand zwischen Servos)
+unsigned long last_init_time = 0;
+int init_servo_index = 0;
+bool init_complete = false;
+
 // MQTT Reconnect Timer (non-blocking)
 unsigned long last_reconnect_attempt = 0;
 const unsigned long reconnect_interval = 5000;  // 5 Sekunden zwischen Versuchen
+
+// ========== EEPROM-FUNKTIONEN ==========
+
+void eeprom_init() {
+  EEPROM.begin(EEPROM_SIZE);
+  Serial.println("EEPROM initialisiert");
+}
+
+void load_home_positions() {
+  // Überprüfe Magic Byte
+  uint8_t magic = EEPROM.read(EEPROM_MAGIC_ADDR);
+  
+  if (magic == EEPROM_MAGIC) {
+    // Gültige Daten in EEPROM vorhanden
+    for (int i = 0; i < 5; i++) {
+      servo_home[i] = EEPROM.read(EEPROM_HOME_START + i);
+      Serial.print("EEPROM: Servo ");
+      Serial.print(i + 1);
+      Serial.print(" Nullposition geladen: ");
+      Serial.println(servo_home[i]);
+    }
+  } else {
+    // Keine gültigen Daten - Standard verwenden
+    Serial.println("Keine gespeicherten Nullpositionen - verwende Standard (0°)");
+    for (int i = 0; i < 5; i++) {
+      servo_home[i] = 0;
+    }
+  }
+}
+
+void save_home_position(int servo_index, int home_pos) {
+  if (servo_index >= 0 && servo_index < 5) {
+    // Speichere die Position
+    EEPROM.write(EEPROM_HOME_START + servo_index, home_pos);
+    servo_home[servo_index] = home_pos;
+    
+    // Speichere Magic Byte beim ersten Mal
+    EEPROM.write(EEPROM_MAGIC_ADDR, EEPROM_MAGIC);
+    
+    // Commit zum Flash-Speicher
+    EEPROM.commit();
+    
+    Serial.print("EEPROM: Servo ");
+    Serial.print(servo_index + 1);
+    Serial.print(" Nullposition gespeichert: ");
+    Serial.println(home_pos);
+  }
+}
 
 // ========== FUNKTIONEN ==========
 
@@ -77,28 +136,48 @@ void setup_wifi() {
   }
 }
 
-void setup_servos() {
-  Serial.println("Initialisiere Servos...");
-  for (int i = 0; i < 5; i++) {
-    servos[i].setPeriodHertz(50);
-    int pin = servos[i].attach(servo_pins[i], 1000, 2000);
-    
-    if (pin != UNKNOWN_PIN) {
-      servo_current_pos[i] = servo_home[i];
-      servo_target_pos[i] = servo_home[i];
-      servos[i].write(servo_home[i]);  // Alle Servos auf Nullposition
-      servo_state[i] = CLOSED;
+void setup_servos_sequential() {
+  // Initiale Setup nur für erstes Servo
+  if (init_servo_index == 0 && !init_complete) {
+    Serial.println("\nStarte sequenzielle Servo-Initialisierung...");
+    last_init_time = millis();
+  }
+
+  // Überprüfe ob 1 Sekunde seit letztem Init vergangen ist
+  if (millis() - last_init_time >= 1000) {
+    if (init_servo_index < 5) {
+      int i = init_servo_index;
       
-      Serial.print("Servo ");
-      Serial.print(i + 1);
-      Serial.print(" an GPIO ");
-      Serial.print(servo_pins[i]);
-      Serial.print(" - Nullposition: ");
-      Serial.println(servo_home[i]);
+      // Servo initialisieren
+      servos[i].setPeriodHertz(50);
+      int pin = servos[i].attach(servo_pins[i], 1000, 2000);
+      
+      if (pin != UNKNOWN_PIN) {
+        // Fahre zu Nullposition
+        servo_current_pos[i] = servo_home[i];
+        servo_target_pos[i] = servo_home[i];
+        servos[i].write(servo_home[i]);
+        servo_state[i] = CLOSED;
+        
+        Serial.print("✓ Servo ");
+        Serial.print(i + 1);
+        Serial.print(" initialisiert an GPIO ");
+        Serial.print(servo_pins[i]);
+        Serial.print(" - Nullposition: ");
+        Serial.print(servo_home[i]);
+        Serial.println("°");
+      } else {
+        Serial.print("✗ FEHLER: Servo ");
+        Serial.print(i + 1);
+        Serial.println(" konnte nicht initialisiert werden!");
+      }
+      
+      init_servo_index++;
+      last_init_time = millis();
     } else {
-      Serial.print("FEHLER: Servo ");
-      Serial.print(i + 1);
-      Serial.println(" konnte nicht initialisiert werden!");
+      // Alle Servos initialisiert
+      init_complete = true;
+      Serial.println("\n✓ Alle Servos initialisiert - System bereit!\n");
     }
   }
 }
@@ -169,6 +248,12 @@ void mqtt_callback(char* topic, byte* payload, unsigned int length) {
     return;
   }
 
+  // Keine Befehle während Initialisierung
+  if (!init_complete) {
+    Serial.println("Fehler: System wird noch initialisiert. Bitte warten...");
+    return;
+  }
+
   int servo_index = slot - 1;
 
   Serial.print("Empfangen: Slot ");
@@ -220,6 +305,9 @@ void mqtt_callback(char* topic, byte* payload, unsigned int length) {
       servos[servo_index].write(home_pos);
       servo_state[servo_index] = CLOSED;
       
+      // Speichere in EEPROM (nonvolatil)
+      save_home_position(servo_index, home_pos);
+      
       Serial.print("Servo ");
       Serial.print(slot);
       Serial.print(" Nullposition gespeichert: ");
@@ -231,6 +319,7 @@ void mqtt_callback(char* topic, byte* payload, unsigned int length) {
       response["command"] = "config";
       response["homePos"] = home_pos;
       response["status"] = "ok";
+      response["stored"] = "eeprom";
       char buffer[256];
       serializeJson(response, buffer);
       client.publish((String(mqtt_topic) + "/config/response").c_str(), buffer);
@@ -239,10 +328,30 @@ void mqtt_callback(char* topic, byte* payload, unsigned int length) {
       Serial.println(home_pos);
     }
   }
+  else if (strcmp(state, "status") == 0) {
+    // Status-Anfrage: gebe aktuelle Positionen aus
+    StaticJsonDocument<256> status_response;
+    JsonArray positions = status_response.createNestedArray("positions");
+    
+    for (int i = 0; i < 5; i++) {
+      JsonObject servo_status = positions.createNestedObject();
+      servo_status["slot"] = i + 1;
+      servo_status["home"] = servo_home[i];
+      servo_status["current"] = servo_current_pos[i];
+      servo_status["state"] = (servo_state[i] == CLOSED) ? "closed" :
+                              (servo_state[i] == OPEN) ? "open" :
+                              (servo_state[i] == CLOSING) ? "closing" :
+                              (servo_state[i] == OPENING) ? "opening" : "init";
+    }
+    
+    char buffer[512];
+    serializeJson(status_response, buffer);
+    client.publish((String(mqtt_topic) + "/status/response").c_str(), buffer);
+  }
   else {
     Serial.print("Fehler: Unbekannter State '");
     Serial.print(state);
-    Serial.println("'. Erwartet: 'on', 'off' oder 'config'");
+    Serial.println("'. Erwartet: 'on', 'off', 'config' oder 'status'");
   }
 }
 
@@ -317,14 +426,21 @@ void setup() {
   Serial.begin(115200);
   delay(100);
   
-  Serial.println("\n\nHopdropper ESP32-C6 Firmware startet...");
-  Serial.println("Version: 2.0 - Mit sanften Bewegungen und individuellen Nullpositionen");
+  Serial.println("\n\n===========================================");
+  Serial.println("Hopdropper ESP32-C6 Firmware v2.1");
+  Serial.println("Mit EEPROM-Speicherung & sequenzieller Init");
+  Serial.println("===========================================\n");
+  
+  // EEPROM initialisieren und Nullpositionen laden
+  eeprom_init();
+  load_home_positions();
   
   setup_wifi();
-  setup_servos();
   
   client.setServer(mqtt_server, mqtt_port);
   client.setCallback(mqtt_callback);
+  
+  Serial.println("\nBeginn Servo-Initialisierung in 1 Sekunden-Abstand...\n");
 }
 
 // ========== LOOP ==========
@@ -334,21 +450,30 @@ void loop() {
     setup_wifi();
   }
 
-  // MQTT verbunden? (Non-blocking)
-  if (!client.connected()) {
-    reconnect();
+  // Sequenzielle Servo-Initialisierung
+  if (!init_complete) {
+    setup_servos_sequential();
   }
-  client.loop();
 
-  // Sanfte Servo-Bewegungen verarbeiten
-  for (int i = 0; i < 5; i++) {
-    if (servo_state[i] == OPENING || servo_state[i] == CLOSING) {
-      move_servo_smooth(i);
+  // MQTT verbunden? (Non-blocking) - nur wenn Init komplett
+  if (init_complete) {
+    if (!client.connected()) {
+      reconnect();
     }
+    client.loop();
   }
 
-  // Automatisches Schließen prüfen
-  handle_auto_close();
+  // Sanfte Servo-Bewegungen verarbeiten (nur wenn Init komplett)
+  if (init_complete) {
+    for (int i = 0; i < 5; i++) {
+      if (servo_state[i] == OPENING || servo_state[i] == CLOSING) {
+        move_servo_smooth(i);
+      }
+    }
+
+    // Automatisches Schließen prüfen
+    handle_auto_close();
+  }
 
   delay(10);
 }
