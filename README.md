@@ -7,6 +7,8 @@ CraftBeerPi 4 Plugin für einen über MQTT gesteuerten Hopdropper mit 5 Slots.
 ```bash
 pip install .
 cbpi add cbpi4_hopdropper
+oder
+pipx inject cbpi4 ~/cbpi4_myhopdropper/Hopdropper
 ```
 
 Danach CraftBeerPi neu starten. MQTT muss in CBPi4 (Settings) aktiviert sein.
