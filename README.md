@@ -9,6 +9,8 @@ pip install .
 cbpi add cbpi4_hopdropper
 oder
 pipx inject cbpi4 ~/cbpi4_myhopdropper/Hopdropper
+
+Package link: https://github.com/HolmSommer/Hopdropper/archive/refs/heads/main.zip
 ```
 
 Danach CraftBeerPi neu starten. MQTT muss in CBPi4 (Settings) aktiviert sein.
